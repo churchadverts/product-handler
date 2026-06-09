@@ -1,3 +1,18 @@
+"""
+ProductsHandler
+---------------
+Triggered by EvolutionCleaner after product images are staged/approved.
+Receives a list of approved media_urls from product_image_staging.
+
+Responsibilities:
+  1. Exact binary deduplication via MD5 hash grouping.
+  2. Thumbnail AI filter check (gpt-4o-mini, low-detail, no multiplier unless tokens are too high).
+  3. Semantic deduplication check against the current batch items to group alternative views.
+  4. Download high-quality source images and run deep description analysis (always multiplied cost).
+  5. Save to products table with status='discovered'.
+  6. Log AI + storage usage for billing reconciliation.
+"""
+
 import asyncio
 import hashlib
 import json
@@ -44,28 +59,33 @@ STORAGE_COST_PER_MB          = 0.000021
 def log_ai_usage(
     business_id:       str,
     run_id:            str,
+    bot_id:            str,
     model:             str,
     prompt_tokens:     int,
     completion_tokens: int,
+    multiplier:        float = 1.0
 ) -> float:
     try:
-        # Base token cost calculation
-        base_cost = (
-            prompt_tokens     * VISION_INPUT_COST_PER_TOKEN +
-            completion_tokens * VISION_OUTPUT_COST_PER_TOKEN
-        )
-        # Apply 5x profit markup multiplier
-        cost = round(base_cost * 5.0, 6)
+        total_tokens = prompt_tokens + completion_tokens
+        
+        # Rule: No multiplier for the first two runs UNLESS tokens are too high
+        if bot_id in ["thumbnail_filter", "semantic_dedup"] and total_tokens > 1500:
+            multiplier = 5.0
 
+        cost = round(
+            (prompt_tokens     * VISION_INPUT_COST_PER_TOKEN +
+             completion_tokens * VISION_OUTPUT_COST_PER_TOKEN) * multiplier,
+            6
+        )
         supabase.table("ai_usage_log").insert({
             "business_id":        business_id,
             "run_id":             run_id,
-            "bot_id":             "products_handler",
+            "bot_id":             bot_id,
             "model":              model,
             "input_type":         "vision",
             "prompt_tokens":      prompt_tokens,
             "completion_tokens":  completion_tokens,
-            "total_tokens":       prompt_tokens + completion_tokens,
+            "total_tokens":       total_tokens,
             "estimated_cost_usd": cost,
             "created_at":         datetime.now(timezone.utc).isoformat()
         }).execute()
@@ -135,8 +155,105 @@ def upload_to_storage(
         return None, file_path
 
 # ============================================================
-# SECTION 4 — VISION ENRICHMENT
+# SECTION 4 — VISION PIPELINE RUNS
 # ============================================================
+
+async def filter_thumbnail_ai(image_url: str, business_info: dict, business_id: str, run_id: str) -> dict | None:
+    """RUN 1: Check if the thumbnail is a valid product based on the profile context."""
+    business_name = business_info.get("name", "Unknown")
+    biz_type      = business_info.get("business_type", "general")
+    
+    system_prompt = f"""You are a product screening helper for "{business_name}" ({biz_type}).
+Analyze this low-resolution image thumbnail and determine if it represents an items/service catalog offering.
+Filter out junk, payment/M-Pesa screenshots, memes, text receipts, personal chat selfies, or bad images.
+
+Return ONLY a valid JSON object:
+{{
+  "is_product": true or false,
+  "reason": "A 5-word summary description of what this item is"
+}}"""
+
+    try:
+        response = await client_ai.chat.completions.create(
+            model           = VISION_MODEL,
+            max_tokens      = 150,
+            temperature     = 0.1,
+            response_format = {"type": "json_object"},
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image_url", "image_url": {"url": image_url, "detail": "low"}},
+                        {"type": "text",      "text": "Is this a valid catalog item?"}
+                    ]
+                }
+            ]
+        )
+        usage = response.usage
+        log_ai_usage(
+            business_id       = business_id,
+            run_id            = run_id,
+            bot_id            = "thumbnail_filter",
+            model             = VISION_MODEL,
+            prompt_tokens     = usage.prompt_tokens,
+            completion_tokens = usage.completion_tokens,
+            multiplier        = 1.0
+        )
+        return json.loads(response.choices[0].message.content.strip())
+    except Exception as e:
+        print(f"  [Filter AI] Failed: {e}")
+        return None
+
+
+async def check_semantic_duplicate(image_url: str, item_reason: str, current_batch: list[dict], business_id: str, run_id: str) -> dict | None:
+    """RUN 2: Check if this item is a semantic duplicate (different angle/duplicate) of another item processed in this batch."""
+    batch_items_str = json.dumps([{"title": i["title"], "description": i["description"]} for i in current_batch])
+    
+    system_prompt = f"""You are checking for catalog item duplicates.
+We have already identified these products in the current batch processing run:
+{batch_items_str}
+
+Analyze this new image thumbnail (identified as: {item_reason}). Determine if it shows the EXACT SAME product/item model (e.g. an alternate photo angle or a re-uploaded match) as one of the items listed above.
+
+Return ONLY a valid JSON object:
+{{
+  "is_duplicate": true or false,
+  "matched_title": "Title of the item it matches, or null if false"
+}}"""
+
+    try:
+        response = await client_ai.chat.completions.create(
+            model           = VISION_MODEL,
+            max_tokens      = 150,
+            temperature     = 0.1,
+            response_format = {"type": "json_object"},
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image_url", "image_url": {"url": image_url, "detail": "low"}},
+                        {"type": "text",      "text": "Is this an alternate view or duplicate item?"}
+                    ]
+                }
+            ]
+        )
+        usage = response.usage
+        log_ai_usage(
+            business_id       = business_id,
+            run_id            = run_id,
+            bot_id            = "semantic_dedup",
+            model             = VISION_MODEL,
+            prompt_tokens     = usage.prompt_tokens,
+            completion_tokens = usage.completion_tokens,
+            multiplier        = 1.0
+        )
+        return json.loads(response.choices[0].message.content.strip())
+    except Exception as e:
+        print(f"  [Semantic Dedup] Failed: {e}")
+        return None
+
 
 async def analyse_image(
     image_url:     str,
@@ -144,17 +261,13 @@ async def analyse_image(
     business_id:   str,
     run_id:        str
 ) -> dict | None:
-    """
-    Call GPT-4o-mini vision to extract structured product metadata.
-    Returns parsed JSON dict or None on failure/non-product.
-    """
+    """RUN 3: Call GPT-4o-mini vision to extract structured product metadata. ALWAYS multiplied cost."""
     business_name = business_info.get("name", "Unknown")
     currency      = business_info.get("currency", "KES")
     biz_type      = business_info.get("business_type", "general")
-    industry      = business_info.get("industry", "general")
 
     system_prompt = f"""You are a product cataloguing assistant for an African SME called "{business_name}".
-Industry: {industry}. Business type: {biz_type}. Currency: {currency}.
+Business type: {biz_type}. Currency: {currency}.
 
 Analyse the product image and return ONLY a valid JSON object. No preamble. No markdown fences.
 
@@ -173,10 +286,7 @@ Return:
   "price_visible":     true or false,
   "price_estimate":    numeric price in {currency} if visible or inferable. null if unknown.,
   "confidence":        "high | medium | low"
-}}
-
-If the image is NOT a product (receipt, screenshot, meme, document, person only):
-{{"is_product": false}}"""
+}}"""
 
     try:
         response = await client_ai.chat.completions.create(
@@ -199,9 +309,11 @@ If the image is NOT a product (receipt, screenshot, meme, document, person only)
         log_ai_usage(
             business_id       = business_id,
             run_id            = run_id,
+            bot_id            = "products_handler",
             model             = VISION_MODEL,
             prompt_tokens     = usage.prompt_tokens,
             completion_tokens = usage.completion_tokens,
+            multiplier        = 5.0 # Always multipling cost on the final run
         )
         return json.loads(response.choices[0].message.content.strip())
     except Exception as e:
@@ -218,7 +330,6 @@ def get_existing_handles(business_id: str) -> set:
         res = supabase.table("products") \
             .select("handle") \
             .eq("business_id", business_id) \
-            .eq("source", "discovered") \
             .execute()
         return {r["handle"] for r in (res.data or []) if r.get("handle")}
     except Exception:
@@ -230,10 +341,7 @@ def build_handle(title: str) -> str:
 
 
 def insert_product(business_id: str, ai_result: dict, stored_url: str, is_ecommerce: bool) -> str | None:
-    """
-    Build and insert a product row.
-    Returns the handle on success, None on failure or duplicate.
-    """
+    """Build and insert a product row with status='discovered'."""
     title  = ai_result.get("title") or "Unnamed Product"
     handle = build_handle(title)
 
@@ -253,6 +361,7 @@ def insert_product(business_id: str, ai_result: dict, stored_url: str, is_ecomme
         "price":             price_val,
         "images":            [stored_url],
         "type":              "product" if is_ecommerce else "service",
+        "status":            "discovered", # Appears as discovered on frontend
         "source":            "discovered",
         "handle":            handle,
         "product_type":      ai_result.get("product_type"),
@@ -280,13 +389,13 @@ def insert_product(business_id: str, ai_result: dict, stored_url: str, is_ecomme
 # ============================================================
 
 async def run_products_pipeline(business_id: str, approved_media_urls: list[str]):
-    """Full pipeline for one batch of approved product images."""
+    """Full architectural pipeline for processing discovery images sequentially."""
     run_id = str(uuid.uuid4())
     print(f"\n[ProductsHandler] Starting — business:{business_id} run:{run_id}")
 
     try:
         db_res = supabase.table("product_image_staging") \
-            .select("media_url, raw_payload") \
+            .select("media_url") \
             .eq("business_id", business_id) \
             .eq("status", "approved") \
             .execute()
@@ -302,7 +411,7 @@ async def run_products_pipeline(business_id: str, approved_media_urls: list[str]
         print(f"  [ProductsHandler] No approved images — exiting")
         return
 
-    print(f"  [ProductsHandler] Processing {len(all_urls)} approved images")
+    print(f"  [ProductsHandler] Processing {len(all_urls)} images through discovery filter funnel")
 
     try:
         biz_res = supabase.table("businesses") \
@@ -314,59 +423,72 @@ async def run_products_pipeline(business_id: str, approved_media_urls: list[str]
     except Exception:
         business_info = {}
 
-    is_ecommerce     = business_info.get("business_type") == "ecommerce"
-    existing_handles = get_existing_handles(business_id)
-    discovered       = []
+    is_ecommerce        = business_info.get("business_type") == "ecommerce"
+    existing_handles    = get_existing_handles(business_id)
+    processed_hashes    = set()
+    discovered_in_batch = []
 
     for index, media_url in enumerate(all_urls):
-        print(f"  [ProductsHandler] [{index+1}/{len(all_urls)}] {media_url[:60]}...")
+        print(f"  [ProductsHandler] [{index+1}/{len(all_urls)}] {media_url[:50]}...")
 
+        # 1. Download image bytes
         image_bytes = await download_image(media_url)
         if not image_bytes:
-            print(f"  [ProductsHandler] Download failed — skipping")
             continue
 
+        # Exact Duplicate Match (Group identical items instantly using binary hash)
+        img_hash = hashlib.md5(image_bytes).hexdigest()
+        if img_hash in processed_hashes:
+            print(f"  [ProductsHandler] Exact duplicate binary found — skipping")
+            continue
+        processed_hashes.add(img_hash)
+
+        # Upload image to storage bucket
         stored_url, file_path = upload_to_storage(business_id, run_id, image_bytes, index)
         if not stored_url:
-            print(f"  [ProductsHandler] Storage upload failed — skipping")
             continue
 
-        log_storage_usage(
-            business_id     = business_id,
-            run_id          = run_id,
-            file_path       = file_path,
-            file_size_bytes = len(image_bytes)
-        )
+        log_storage_usage(business_id, run_id, file_path, len(image_bytes))
 
+        # 2. Thumbnail AI Filter (Run 1)
+        is_prod_res = await filter_thumbnail_ai(stored_url, business_info, business_id, run_id)
+        if not is_prod_res or not is_prod_res.get("is_product"):
+            print(f"  [ProductsHandler] Not a valid product matching context — skipping")
+            continue
+
+        reason_desc = is_prod_res.get("reason", "")
+
+        # 3. Semantic Deduplication / Alternate View Check (Run 2)
+        if discovered_in_batch:
+            is_dup_res = await check_semantic_duplicate(stored_url, reason_desc, discovered_in_batch, business_id, run_id)
+            if is_dup_res and is_dup_res.get("is_duplicate"):
+                print(f"  [ProductsHandler] Semantic match found (alternate image perspective) — skipping")
+                continue
+
+        # 4. High-Res Enrichment (Run 3 — Always Multiplied)
         ai_result = await analyse_image(stored_url, business_info, business_id, run_id)
-
-        if not ai_result:
-            print(f"  [ProductsHandler] Vision returned nothing — skipping")
-            continue
-        if ai_result.get("is_product") is False:
-            print(f"  [ProductsHandler] Not a product — skipping")
-            continue
-        if ai_result.get("confidence", "low") == "low":
-            print(f"  [ProductsHandler] Low confidence — skipping")
+        if not ai_result or ai_result.get("confidence", "low") == "low":
             continue
 
+        # 5. Handle deduplication check against database records
         title  = ai_result.get("title") or "Unnamed Product"
         handle = build_handle(title)
         if handle in existing_handles:
-            print(f"  [ProductsHandler] '{handle}' already exists — skipping")
+            print(f"  [ProductsHandler] '{handle}' already exists in DB — skipping")
             continue
 
+        # 6. Save product to database
         saved_handle = insert_product(business_id, ai_result, stored_url, is_ecommerce)
         if saved_handle:
             existing_handles.add(saved_handle)
-            discovered.append({
-                "title":        title,
-                "handle":       saved_handle,
-                "product_type": ai_result.get("product_type"),
-                "confidence":   ai_result.get("confidence"),
+            discovered_in_batch.append({
+                "title":       title,
+                "handle":      saved_handle,
+                "description": ai_result.get("description_short") or ""
             })
-            print(f"  [ProductsHandler] ✓ Saved '{title}'")
+            print(f"  [ProductsHandler] ✓ Discovered & Saved '{title}'")
 
+        # Mark staging row as processed
         try:
             supabase.table("product_image_staging") \
                 .update({"status": "processed", "processed_at": datetime.now(timezone.utc).isoformat()}) \
@@ -376,7 +498,7 @@ async def run_products_pipeline(business_id: str, approved_media_urls: list[str]
         except Exception as e:
             print(f"  [ProductsHandler] Staging status update failed: {e}")
 
-    print(f"\n[ProductsHandler] ✓ Complete — {len(discovered)}/{len(all_urls)} products saved")
+    print(f"\n[ProductsHandler] ✓ Complete — {len(discovered_in_batch)} products saved as discovered")
 
 # ============================================================
 # SECTION 7 — FASTAPI APP
